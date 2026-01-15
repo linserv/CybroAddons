@@ -58,7 +58,14 @@ class TurnoverReport(models.TransientModel):
         "res.company",
         string="Company",
         default=lambda self: self.env.company,
-        help="Select multiple companies " "from the list.",
+        help="Select multiple companies from the list.",
+    )
+    include_view_locations = fields.Boolean(
+        string="Include View Locations",
+        default=False,
+        help="Enable this if your delivery operations use warehouse view locations "
+             "(e.g., 'ORE', 'MOT') as source. By default, only internal stock "
+             "locations are included.",
     )
 
     def _default_categ_ids(self):
@@ -255,13 +262,25 @@ class TurnoverReport(models.TransientModel):
         location_ids = []
         if self.warehouse_ids:
             for warehouse in self.warehouse_ids:
+                # Build usage filter - always include 'internal', optionally add 'view'
+                usage_types = ['internal']
+                if self.include_view_locations:
+                    usage_types.append('view')
+                
                 location_ids += (
                     self.env["stock.location"]
-                    .search([("location_id", "child_of", warehouse.view_location_id.id), ("usage", "=", "internal")])
+                    .search([
+                        ("location_id", "child_of", warehouse.view_location_id.id), 
+                        ("usage", "in", usage_types)
+                    ])
                     .ids
                 )
         else:
-            location_ids = self.env["stock.location"].search([("usage", "=", "internal")]).ids
+            # No warehouse filter - get all internal locations (and view if enabled)
+            usage_types = ['internal']
+            if self.include_view_locations:
+                usage_types.append('view')
+            location_ids = self.env["stock.location"].search([("usage", "in", usage_types)]).ids
 
         if not location_ids:
             return stock_report
@@ -376,18 +395,33 @@ class TurnoverReport(models.TransientModel):
         """Batch calculate stock for all products/locations at a specific date using SQL.
         Returns dict: {(product_id, location_id): quantity}
         """
+        company_ids = self.company_ids.ids if self.company_ids else []
+        
         if not target_date:
             # Use current stock from quants
-            self.env.cr.execute(
-                """
-                SELECT product_id, location_id, SUM(quantity)
-                FROM stock_quant
-                WHERE product_id IN %s
-                AND location_id IN %s
-                GROUP BY product_id, location_id
-            """,
-                (tuple(product_ids), tuple(location_ids)),
-            )
+            if company_ids:
+                self.env.cr.execute(
+                    """
+                    SELECT product_id, location_id, SUM(quantity)
+                    FROM stock_quant
+                    WHERE product_id IN %s
+                    AND location_id IN %s
+                    AND company_id IN %s
+                    GROUP BY product_id, location_id
+                """,
+                    (tuple(product_ids), tuple(location_ids), tuple(company_ids)),
+                )
+            else:
+                self.env.cr.execute(
+                    """
+                    SELECT product_id, location_id, SUM(quantity)
+                    FROM stock_quant
+                    WHERE product_id IN %s
+                    AND location_id IN %s
+                    GROUP BY product_id, location_id
+                """,
+                    (tuple(product_ids), tuple(location_ids)),
+                )
 
             result = {}
             for row in self.env.cr.fetchall():
@@ -398,21 +432,39 @@ class TurnoverReport(models.TransientModel):
         target_datetime = datetime.combine(target_date, time.max)
 
         # Query incoming moves (to our locations)
-        self.env.cr.execute(
-            """
-            SELECT 
-                sm.product_id,
-                sm.location_dest_id as location_id,
-                SUM(sm.product_uom_qty) as qty
-            FROM stock_move sm
-            WHERE sm.product_id IN %s
-            AND sm.state = 'done'
-            AND sm.date <= %s
-            AND sm.location_dest_id IN %s
-            GROUP BY sm.product_id, sm.location_dest_id
-        """,
-            (tuple(product_ids), target_datetime, tuple(location_ids)),
-        )
+        if company_ids:
+            self.env.cr.execute(
+                """
+                SELECT 
+                    sm.product_id,
+                    sm.location_dest_id as location_id,
+                    SUM(sm.product_uom_qty) as qty
+                FROM stock_move sm
+                WHERE sm.product_id IN %s
+                AND sm.state = 'done'
+                AND sm.date <= %s
+                AND sm.location_dest_id IN %s
+                AND sm.company_id IN %s
+                GROUP BY sm.product_id, sm.location_dest_id
+            """,
+                (tuple(product_ids), target_datetime, tuple(location_ids), tuple(company_ids)),
+            )
+        else:
+            self.env.cr.execute(
+                """
+                SELECT 
+                    sm.product_id,
+                    sm.location_dest_id as location_id,
+                    SUM(sm.product_uom_qty) as qty
+                FROM stock_move sm
+                WHERE sm.product_id IN %s
+                AND sm.state = 'done'
+                AND sm.date <= %s
+                AND sm.location_dest_id IN %s
+                GROUP BY sm.product_id, sm.location_dest_id
+            """,
+                (tuple(product_ids), target_datetime, tuple(location_ids)),
+            )
 
         result = {}
         for row in self.env.cr.fetchall():
@@ -420,21 +472,39 @@ class TurnoverReport(models.TransientModel):
             result[key] = result.get(key, 0) + (row[2] or 0)
 
         # Query outgoing moves (from our locations)
-        self.env.cr.execute(
-            """
-            SELECT 
-                sm.product_id,
-                sm.location_id,
-                SUM(sm.product_uom_qty) as qty
-            FROM stock_move sm
-            WHERE sm.product_id IN %s
-            AND sm.state = 'done'
-            AND sm.date <= %s
-            AND sm.location_id IN %s
-            GROUP BY sm.product_id, sm.location_id
-        """,
-            (tuple(product_ids), target_datetime, tuple(location_ids)),
-        )
+        if company_ids:
+            self.env.cr.execute(
+                """
+                SELECT 
+                    sm.product_id,
+                    sm.location_id,
+                    SUM(sm.product_uom_qty) as qty
+                FROM stock_move sm
+                WHERE sm.product_id IN %s
+                AND sm.state = 'done'
+                AND sm.date <= %s
+                AND sm.location_id IN %s
+                AND sm.company_id IN %s
+                GROUP BY sm.product_id, sm.location_id
+            """,
+                (tuple(product_ids), target_datetime, tuple(location_ids), tuple(company_ids)),
+            )
+        else:
+            self.env.cr.execute(
+                """
+                SELECT 
+                    sm.product_id,
+                    sm.location_id,
+                    SUM(sm.product_uom_qty) as qty
+                FROM stock_move sm
+                WHERE sm.product_id IN %s
+                AND sm.state = 'done'
+                AND sm.date <= %s
+                AND sm.location_id IN %s
+                GROUP BY sm.product_id, sm.location_id
+            """,
+                (tuple(product_ids), target_datetime, tuple(location_ids)),
+            )
 
         for row in self.env.cr.fetchall():
             key = (row[0], row[1])
@@ -452,6 +522,10 @@ class TurnoverReport(models.TransientModel):
             ("state", "=", "done"),
             ("location_dest_id.usage", "=", "customer"),
         ]
+        
+        # Add company filter if specified
+        if self.company_ids:
+            domain.append(("company_id", "in", self.company_ids.ids))
 
         if self.start_date:
             start_datetime = datetime.combine(self.start_date, time.min)
@@ -485,6 +559,10 @@ class TurnoverReport(models.TransientModel):
             ("state", "=", "done"),
             ("location_id.usage", "=", "supplier"),
         ]
+        
+        # Add company filter if specified
+        if self.company_ids:
+            domain.append(("company_id", "in", self.company_ids.ids))
 
         if self.start_date:
             start_datetime = datetime.combine(self.start_date, time.min)
